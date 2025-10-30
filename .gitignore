@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.sqlite3
+
+# Virtual env
+.venv/
+venv/
+
+# Output and logs
+out/
+logs/
+*.log
+
+# Keys and certs (never commit)
+keys/
+*.pem
+*.crt
+*.csr
+*.key
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Misc
+.temp/
+.cache/
+build/
+dist/
+.eggs/
+*.egg-info/
