@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field  # dataclass 用于定义结构化配置对象
 from pathlib import Path  # Path 提供跨平台路径处理
-from typing import List  # List 类型提示
+from typing import List
 
 import yaml  # PyYAML 用于解析配置文件
 
@@ -60,6 +60,24 @@ class SecurityConfig:
 
 
 @dataclass(slots=True)
+class ConnectivityConfig:
+    """网络层连接参数。"""
+
+    heartbeat_sec: int  # 心跳间隔秒
+    connect_timeout_ms: int  # TLS 连接超时毫秒
+    backoff: List[int] = field(default_factory=list)  # 重连退避序列
+
+
+@dataclass(slots=True)
+class StatusHttpConfig:
+    """状态页 HTTP 服务配置。"""
+
+    enabled: bool  # 是否启用状态页
+    host: str  # 监听地址
+    port: int  # 监听端口
+
+
+@dataclass(slots=True)
 class TransferConfig:
     """传输行为配置。"""
 
@@ -87,6 +105,8 @@ class KeyMeshConfig:
     shares: List[ShareConfig]  # 共享定义
     transfer: TransferConfig  # 传输配置
     logging: LoggingConfig  # 日志配置
+    connectivity: ConnectivityConfig  # 网络连接配置
+    status_http: StatusHttpConfig  # 状态页配置
 
 
 def _load_yaml(path: Path) -> dict:
@@ -110,6 +130,8 @@ def load_config(config_path: str | Path = DEFAULT_CONFIG_FILE, *, check_files: b
     shares_raw = raw.get("shares") or []  # 获取 shares 列表
     transfer_raw = raw.get("transfer") or {}  # 获取 transfer 段
     logging_raw = raw.get("logging") or {}  # 获取 logging 段
+    connectivity_raw = raw.get("connectivity") or {}  # 获取 connectivity 段
+    status_http_raw = raw.get("status_http") or {}  # 获取状态页配置
     node = NodeConfig(  # 构造 NodeConfig
         id=node_raw.get("id", ""),  # 节点 ID
         listen_port=int(node_raw.get("listen_port", 0)),  # 监听端口
@@ -119,7 +141,7 @@ def load_config(config_path: str | Path = DEFAULT_CONFIG_FILE, *, check_files: b
         ca_cert=normalize_path(path.parent, security_raw.get("ca_cert", "")),  # CA 证书绝对路径
         cert=normalize_path(path.parent, security_raw.get("cert", "")),  # 节点证书绝对路径
         key=normalize_path(path.parent, security_raw.get("key", "")),  # 私钥绝对路径
-        fingerprint_whitelist=list(security_raw.get("fingerprint_whitelist", [])),  # 指纹白名单
+        fingerprint_whitelist=[(fp or "").strip().lower() for fp in security_raw.get("fingerprint_whitelist", [])],  # 指纹白名单
     )
     shares: List[ShareConfig] = []  # 初始化 share 容器
     seen_share_names: set[str] = set()  # 记录已出现的共享名称
@@ -154,7 +176,7 @@ def load_config(config_path: str | Path = DEFAULT_CONFIG_FILE, *, check_files: b
         peer = PeerConfig(  # 构造 PeerConfig
             id=peer_entry.get("id", ""),
             addr=peer_entry.get("addr", ""),
-            cert_fingerprint=peer_entry.get("cert_fingerprint", ""),
+            cert_fingerprint=((peer_entry.get("cert_fingerprint", "") or "").strip().lower()),
             shares_access=access_list,
         )
         peers.append(peer)  # 将 peer 加入列表
@@ -168,6 +190,16 @@ def load_config(config_path: str | Path = DEFAULT_CONFIG_FILE, *, check_files: b
         level=logging_raw.get("level", "info"),
         file=normalize_path(path.parent, logging_raw["file"]) if logging_raw.get("file") else None,
     )
+    connectivity = ConnectivityConfig(  # 构造 ConnectivityConfig
+        heartbeat_sec=int(connectivity_raw.get("heartbeat_sec", 20)),
+        connect_timeout_ms=int(connectivity_raw.get("connect_timeout_ms", 5000)),
+        backoff=[int(x) for x in (connectivity_raw.get("backoff") or [1, 3, 10, 30])],
+    )
+    status_http = StatusHttpConfig(  # 构造状态页配置
+        enabled=bool(status_http_raw.get("enabled", True)),
+        host=status_http_raw.get("host", "127.0.0.1"),
+        port=int(status_http_raw.get("port", 52180)),
+    )
     config = KeyMeshConfig(  # 聚合为整体配置对象
         node=node,
         security=security,
@@ -175,7 +207,23 @@ def load_config(config_path: str | Path = DEFAULT_CONFIG_FILE, *, check_files: b
         shares=shares,
         transfer=transfer,
         logging=logging_config,
+        connectivity=connectivity,
+        status_http=status_http,
     )
+    # 校验心跳与退避参数
+    if config.connectivity.heartbeat_sec <= 0:
+        raise ValueError("heartbeat_sec must be positive")
+    if config.connectivity.connect_timeout_ms <= 0:
+        raise ValueError("connect_timeout_ms must be positive")
+    if not config.connectivity.backoff:
+        raise ValueError("backoff must contain at least one value")
+    for value in config.connectivity.backoff:
+        if value <= 0:
+            raise ValueError("backoff values must be positive")
+    if config.status_http.port <= 0 or config.status_http.port > 65535:
+        raise ValueError("status_http.port must be in 1-65535")
+    if config.node.listen_port <= 0 or config.node.listen_port > 65535:
+        raise ValueError("node.listen_port must be in 1-65535")
     if check_files:  # 如果需要检查文件存在性
         missing: List[Path] = []  # 记录缺失路径
         for candidate in [security.ca_cert, security.cert, security.key]:  # 遍历证书文件
