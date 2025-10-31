@@ -8,6 +8,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 from .indexer import build_manifest  # manifest 构建函数
 from .utils.ignore import load_ignore_patterns  # 忽略规则加载
+from .transfer.engine import TransferEngine  # 传输引擎
 
 from .config import KeyMeshConfig, PeerConfig
 from .net.conn_state import PeerInfo
@@ -41,8 +42,10 @@ class AppContext:
                 )
                 for peer in cfg.peers
             }
+            self.transfer_engine = TransferEngine(self)
         else:
             self.peer_states = {}
+            self.transfer_engine = None
         # 跟踪活跃任务，方便统一关闭
         self.tasks: set[asyncio.Task[object]] = set()
         # 缓存最近构建的 manifest，避免重复扫描
