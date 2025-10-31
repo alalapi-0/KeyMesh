@@ -96,6 +96,17 @@ class LoggingConfig:
 
 
 @dataclass(slots=True)
+class IndexingConfig:
+    """索引扫描配置。"""
+
+    small_threshold_mb: int
+    sample_mb: int
+    hash_policy: str
+    ignore_hidden: bool
+    max_workers: int
+
+
+@dataclass(slots=True)
 class KeyMeshConfig:
     """聚合所有配置段的顶层对象。"""
 
@@ -105,6 +116,7 @@ class KeyMeshConfig:
     shares: List[ShareConfig]  # 共享定义
     transfer: TransferConfig  # 传输配置
     logging: LoggingConfig  # 日志配置
+    indexing: IndexingConfig  # 索引配置
     connectivity: ConnectivityConfig  # 网络连接配置
     status_http: StatusHttpConfig  # 状态页配置
 
@@ -130,6 +142,7 @@ def load_config(config_path: str | Path = DEFAULT_CONFIG_FILE, *, check_files: b
     shares_raw = raw.get("shares") or []  # 获取 shares 列表
     transfer_raw = raw.get("transfer") or {}  # 获取 transfer 段
     logging_raw = raw.get("logging") or {}  # 获取 logging 段
+    indexing_raw = raw.get("indexing") or {}  # 获取 indexing 段
     connectivity_raw = raw.get("connectivity") or {}  # 获取 connectivity 段
     status_http_raw = raw.get("status_http") or {}  # 获取状态页配置
     node = NodeConfig(  # 构造 NodeConfig
@@ -190,6 +203,13 @@ def load_config(config_path: str | Path = DEFAULT_CONFIG_FILE, *, check_files: b
         level=logging_raw.get("level", "info"),
         file=normalize_path(path.parent, logging_raw["file"]) if logging_raw.get("file") else None,
     )
+    indexing = IndexingConfig(
+        small_threshold_mb=int(indexing_raw.get("small_threshold_mb", 16)),
+        sample_mb=int(indexing_raw.get("sample_mb", 4)),
+        hash_policy=(indexing_raw.get("hash_policy", "auto") or "auto").lower(),
+        ignore_hidden=bool(indexing_raw.get("ignore_hidden", True)),
+        max_workers=int(indexing_raw.get("max_workers", 4)),
+    )
     connectivity = ConnectivityConfig(  # 构造 ConnectivityConfig
         heartbeat_sec=int(connectivity_raw.get("heartbeat_sec", 20)),
         connect_timeout_ms=int(connectivity_raw.get("connect_timeout_ms", 5000)),
@@ -207,6 +227,7 @@ def load_config(config_path: str | Path = DEFAULT_CONFIG_FILE, *, check_files: b
         shares=shares,
         transfer=transfer,
         logging=logging_config,
+        indexing=indexing,
         connectivity=connectivity,
         status_http=status_http,
     )
@@ -224,6 +245,14 @@ def load_config(config_path: str | Path = DEFAULT_CONFIG_FILE, *, check_files: b
         raise ValueError("status_http.port must be in 1-65535")
     if config.node.listen_port <= 0 or config.node.listen_port > 65535:
         raise ValueError("node.listen_port must be in 1-65535")
+    if config.indexing.small_threshold_mb <= 0:
+        raise ValueError("indexing.small_threshold_mb must be positive")
+    if config.indexing.sample_mb <= 0:
+        raise ValueError("indexing.sample_mb must be positive")
+    if config.indexing.max_workers <= 0:
+        raise ValueError("indexing.max_workers must be positive")
+    if config.indexing.hash_policy not in {"auto", "full", "sample", "meta", "none"}:
+        raise ValueError("indexing.hash_policy must be one of auto/full/sample/meta/none")
     if check_files:  # 如果需要检查文件存在性
         missing: List[Path] = []  # 记录缺失路径
         for candidate in [security.ca_cert, security.cert, security.key]:  # 遍历证书文件
