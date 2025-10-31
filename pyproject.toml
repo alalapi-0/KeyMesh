@@ -13,7 +13,8 @@ dependencies = [
   "rich>=13.7.1",
   "watchdog>=4.0.0",
   "cryptography>=43.0.0",
-  "xxhash>=3.4.1"
+  "xxhash>=3.4.1",
+  "aiofiles>=23.2.1"
 ]
 
 [project.scripts]

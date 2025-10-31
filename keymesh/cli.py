@@ -12,14 +12,20 @@ from typing import Iterable  # Iterable 类型提示
 from urllib import error as urlerror  # urllib 错误处理
 from urllib import request as urlrequest  # urllib 调用状态页
 
+from rich.console import Console
+from rich.table import Table
+
 from .app import AppContext
 from .config import KeyMeshConfig, load_config  # 导入配置加载逻辑
 from .constants import DEFAULT_CONFIG_FILE, DEFAULT_CONFIG_SAMPLE  # 默认常量
+from .diff import compare_manifests
+from .manifest_store import load_manifest, load_previous_manifest, save_manifest
 from .net import server as net_server
 from .net.client import ClientConnector
 from .status_http import run_status_http
 
 LOGGER = logging.getLogger(__name__)  # 获取模块级日志记录器
+CONSOLE = Console()
 
 
 def _read_post_init_note() -> str:
@@ -44,6 +50,45 @@ def _ensure_share_directories(cfg: KeyMeshConfig) -> list[str]:
                 ignore_path.write_text("# KeyMesh ignore patterns\n", encoding="utf-8")  # 写入示例内容
                 messages.append(f"created ignore file: {ignore_path}")  # 添加提示
     return messages  # 返回消息列表
+
+
+def _resolve_share_names(cfg: KeyMeshConfig, requested: str | None) -> list[str]:
+    """根据用户输入解析共享域列表。"""
+
+    if requested:
+        for share in cfg.shares:
+            if share.name == requested:
+                return [share.name]
+        raise ValueError(f"share {requested!r} not defined in config")
+    return [share.name for share in cfg.shares]
+
+
+async def _collect_manifests(app_ctx: AppContext, share_names: list[str], refresh: bool) -> dict[str, dict]:
+    """批量获取 manifest。"""
+
+    results: dict[str, dict] = {}
+    for name in share_names:
+        results[name] = await app_ctx.get_manifest(name, refresh=refresh)
+    return results
+
+
+def _load_peer_manifest(peer_id: str, share_name: str) -> dict | None:
+    """尝试加载指定 peer 的 manifest。"""
+
+    candidates = [
+        f"{peer_id}_{share_name}",
+        f"{peer_id}-{share_name}",
+        f"{peer_id}/{share_name}",
+    ]
+    for key in candidates:
+        manifest = load_manifest(key)
+        if manifest is not None:
+            return manifest
+    peer_dir = Path("out/manifests") / peer_id
+    alt = peer_dir / f"{share_name}_latest.json"
+    if alt.exists():
+        return json.loads(alt.read_text(encoding="utf-8"))
+    return None
 
 
 def command_init(args: argparse.Namespace) -> int:
@@ -103,6 +148,140 @@ def command_list_shares(args: argparse.Namespace) -> int:
     for share in cfg.shares:  # 遍历共享域
         print(f"{share.name}: {share.path}")  # 打印共享信息
     return 0  # 返回成功
+
+
+def command_manifest(args: argparse.Namespace) -> int:
+    """处理 manifest 子命令。"""
+
+    try:
+        cfg = load_config(args.config, check_files=False)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.error("failed to load config: %s", exc)
+        return 1
+    try:
+        share_names = _resolve_share_names(cfg, args.share)
+    except ValueError as exc:
+        LOGGER.error(str(exc))
+        return 1
+    if args.out and len(share_names) != 1:
+        LOGGER.error("--out can only be used when targeting a single share")
+        return 1
+    async def _run() -> dict[str, dict]:
+        app_ctx = AppContext(cfg, logging.getLogger("keymesh.app"), build_runtime=False)
+        return await _collect_manifests(app_ctx, share_names, refresh=True)
+
+    try:
+        manifests = asyncio.run(_run())
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.error("manifest generation failed: %s", exc)
+        return 1
+    table = Table(title="Manifest Summary", header_style="bold")
+    table.add_column("Share", style="cyan")
+    table.add_column("Entries", justify="right")
+    table.add_column("Ignored", justify="right")
+    table.add_column("Skipped", justify="right")
+    table.add_column("Saved Path", overflow="fold")
+    export_path: Path | None = None
+    for share_name in share_names:
+        manifest = manifests[share_name]
+        saved_path = save_manifest(share_name, manifest)
+        target_path = saved_path
+        if args.out:
+            export_path = Path(args.out).expanduser().resolve()
+            export_path.parent.mkdir(parents=True, exist_ok=True)
+            with export_path.open("w", encoding="utf-8") as handle:
+                json.dump(manifest, handle, ensure_ascii=False, indent=2)
+                handle.write("\n")
+            target_path = export_path
+        policy = manifest.get("policy", {})
+        table.add_row(
+            share_name,
+            str(len(manifest.get("entries", []))),
+            str(policy.get("ignore_count", 0)),
+            str(policy.get("skipped", 0)),
+            str(target_path),
+        )
+    CONSOLE.print(table)
+    if export_path:
+        CONSOLE.print(f"[green]Manifest exported to {export_path}[/green]")
+    return 0
+
+
+def command_diff(args: argparse.Namespace) -> int:
+    """处理 diff 子命令。"""
+
+    try:
+        cfg = load_config(args.config, check_files=False)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.error("failed to load config: %s", exc)
+        return 1
+    try:
+        share_names = _resolve_share_names(cfg, args.share)
+    except ValueError as exc:
+        LOGGER.error(str(exc))
+        return 1
+    async def _ensure_local() -> dict[str, dict]:
+        app_ctx = AppContext(cfg, logging.getLogger("keymesh.app"), build_runtime=False)
+        existing: dict[str, dict] = {}
+        for name in share_names:
+            manifest = load_manifest(name)
+            if manifest is None:
+                manifest = await app_ctx.get_manifest(name, refresh=True)
+                save_manifest(name, manifest)
+            existing[name] = manifest
+        return existing
+
+    try:
+        local_manifests = asyncio.run(_ensure_local())
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.error("failed to load local manifests: %s", exc)
+        return 1
+    diffs: dict[str, dict] = {}
+    for share_name in share_names:
+        remote_manifest = _load_peer_manifest(args.peer, share_name)
+        if remote_manifest is None and args.peer in {cfg.node.id, "local"}:
+            remote_manifest = load_previous_manifest(share_name)
+        if remote_manifest is None:
+            LOGGER.warning("no remote manifest found for peer=%s share=%s", args.peer, share_name)
+            continue
+        diffs[share_name] = compare_manifests(local_manifests[share_name], remote_manifest)
+    if not diffs:
+        LOGGER.error("unable to compute diff: missing remote manifests")
+        return 1
+    table = Table(title=f"Diff vs {args.peer}", header_style="bold")
+    table.add_column("Share", style="cyan")
+    table.add_column("Added", justify="right")
+    table.add_column("Modified", justify="right")
+    table.add_column("Deleted", justify="right")
+    for share_name, diff_result in diffs.items():
+        summary = diff_result.get("summary", {})
+        table.add_row(
+            share_name,
+            str(summary.get("added", 0)),
+            str(summary.get("modified", 0)),
+            str(summary.get("deleted", 0)),
+        )
+    CONSOLE.print(table)
+    if not args.dry_run:
+        for share_name, diff_result in diffs.items():
+            if diff_result.get("summary", {}).get("delta", 0) == 0:
+                continue
+            CONSOLE.print(f"[yellow]{share_name} changes:[/yellow]")
+            for label in ("added", "modified", "deleted"):
+                paths = diff_result.get(label, [])
+                if not paths:
+                    continue
+                CONSOLE.print(f"  [bold]{label.title()}[/bold]: {', '.join(paths)}")
+    if args.output and not args.dry_run:
+        out_path = Path(args.output).expanduser().resolve()
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with out_path.open("w", encoding="utf-8") as handle:
+            json.dump(diffs, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+        CONSOLE.print(f"[green]Diff written to {out_path}[/green]")
+    if args.output and args.dry_run:
+        LOGGER.info("dry-run enabled; diff result not written to %s", args.output)
+    return 0
 
 
 async def _run_service(args: argparse.Namespace) -> int:
@@ -208,6 +387,18 @@ def build_parser() -> argparse.ArgumentParser:
     list_parser = subparsers.add_parser("list-shares", help="list configured shares")
     list_parser.add_argument("--config", default=DEFAULT_CONFIG_FILE, help="path to config file")
     list_parser.set_defaults(func=command_list_shares)
+    manifest_parser = subparsers.add_parser("manifest", help="generate share manifest")
+    manifest_parser.add_argument("--config", default=DEFAULT_CONFIG_FILE, help="path to config file")
+    manifest_parser.add_argument("--share", help="target share name; default is all")
+    manifest_parser.add_argument("--out", help="optional export file for single share")
+    manifest_parser.set_defaults(func=command_manifest)
+    diff_parser = subparsers.add_parser("diff", help="compare manifests with a peer")
+    diff_parser.add_argument("--config", default=DEFAULT_CONFIG_FILE, help="path to config file")
+    diff_parser.add_argument("--peer", required=True, help="peer identifier")
+    diff_parser.add_argument("--share", help="target share name; default is all")
+    diff_parser.add_argument("--output", help="write diff result to JSON")
+    diff_parser.add_argument("--dry-run", action="store_true", help="print summary only")
+    diff_parser.set_defaults(func=command_diff)
     run_parser = subparsers.add_parser("run", help="execute the KeyMesh service")
     run_parser.add_argument("--config", default=DEFAULT_CONFIG_FILE, help="path to config file")
     run_parser.add_argument("--status-port", type=int, help="override status HTTP port")

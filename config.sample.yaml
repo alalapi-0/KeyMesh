@@ -41,6 +41,13 @@ shares:
     path: "./data/peers/C"
     delete_propagation: true
 
+indexing:
+  small_threshold_mb: 16
+  sample_mb: 4
+  hash_policy: "auto"
+  ignore_hidden: true
+  max_workers: 4
+
 transfer:
   chunk_mb: 16
   concurrent_files: 2
