@@ -309,6 +309,9 @@ async def _run_service(args: argparse.Namespace) -> int:
     if cfg.status_http.enabled:
         status_task = asyncio.create_task(run_status_http(app_ctx, host=cfg.status_http.host, port=cfg.status_http.port))
         app_ctx.register_task(status_task)
+    if app_ctx.transfer_engine is not None:
+        engine_task = asyncio.create_task(app_ctx.transfer_engine.run_forever())
+        app_ctx.register_task(engine_task)
     LOGGER.info(
         "KeyMesh node %s listening on %s:%s",
         cfg.node.id,
@@ -331,6 +334,8 @@ async def _run_service(args: argparse.Namespace) -> int:
     finally:
         if forever is not None:
             forever.cancel()
+        if app_ctx.transfer_engine is not None:
+            await app_ctx.transfer_engine.stop()
         await app_ctx.cancel_all_tasks()
     return 0
 
@@ -343,6 +348,122 @@ def command_run(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         LOGGER.info("received keyboard interrupt, shutting down")
         return 0
+
+
+def command_send(args: argparse.Namespace) -> int:
+    """手动触发单个文件传输任务。"""
+
+    try:
+        cfg = load_config(args.config, check_files=True)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.error("failed to load config: %s", exc)
+        return 1
+
+    async def _run() -> int:
+        app_ctx = AppContext(cfg, logging.getLogger("keymesh.app"))
+        engine = app_ctx.transfer_engine
+        if engine is None:
+            raise RuntimeError("transfer engine not initialized")
+        runner = asyncio.create_task(engine.run_forever())
+        try:
+            state = await engine.enqueue(
+                args.peer,
+                args.share,
+                {"path": args.file},
+            )
+            last_status = None
+            last_bytes = -1
+            while state.status not in {"success", "failed", "cancelled"}:
+                if state.status != last_status or state.bytes_done != last_bytes:
+                    percent = 0.0
+                    if state.total_bytes:
+                        percent = (state.bytes_done / state.total_bytes) * 100
+                    CONSOLE.print(
+                        f"[{state.status}] #{state.task_id} -> peer={state.peer_id} "
+                        f"share={state.share} file={state.relative_path} ({percent:.1f}%)"
+                    )
+                    last_status = state.status
+                    last_bytes = state.bytes_done
+                await asyncio.sleep(0.5)
+            await engine.stop()
+            await asyncio.gather(runner, return_exceptions=True)
+            if state.status != "success":
+                raise RuntimeError(state.error or "transfer failed")
+            CONSOLE.print(
+                f"[green]Transfer complete:[/green] {state.relative_path} -> {state.peer_id}"
+            )
+            return 0
+        finally:
+            await engine.stop()
+            if not runner.done():
+                runner.cancel()
+                await asyncio.gather(runner, return_exceptions=True)
+
+    try:
+        return asyncio.run(_run())
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.error("send command failed: %s", exc)
+        return 1
+
+
+def command_queue(args: argparse.Namespace) -> int:
+    """查看当前传输任务队列。"""
+
+    try:
+        cfg = load_config(args.config, check_files=False)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.error("failed to load config: %s", exc)
+        return 1
+    snapshot = Path(cfg.transfer.sessions_dir) / "queue.json"
+    if not snapshot.exists():
+        CONSOLE.print("[green]queue empty[/green]")
+        return 0
+    try:
+        tasks = json.loads(snapshot.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        LOGGER.error("failed to parse queue snapshot: %s", exc)
+        return 1
+    if not tasks:
+        CONSOLE.print("[green]queue empty[/green]")
+        return 0
+    table = Table(title="Transfer Queue", header_style="bold")
+    table.add_column("Status")
+    table.add_column("Task")
+    table.add_column("Peer")
+    table.add_column("Share")
+    table.add_column("File", overflow="fold")
+    table.add_column("Progress", justify="right")
+    for entry in tasks:
+        total = entry.get("total_bytes", 0) or 0
+        done = entry.get("bytes_done", 0) or 0
+        percent = 0.0
+        if total:
+            percent = (done / total) * 100
+        table.add_row(
+            entry.get("status", "unknown"),
+            f"#{entry.get('task_id')}",
+            entry.get("peer", "?"),
+            entry.get("share", "?"),
+            entry.get("file", ""),
+            f"{percent:.1f}%",
+        )
+    CONSOLE.print(table)
+    return 0
+
+
+def command_cancel(args: argparse.Namespace) -> int:
+    """取消指定任务。"""
+
+    try:
+        cfg = load_config(args.config, check_files=False)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.error("failed to load config: %s", exc)
+        return 1
+    flag = Path(cfg.transfer.sessions_dir) / f"cancel_{args.task_id}.flag"
+    flag.parent.mkdir(parents=True, exist_ok=True)
+    flag.write_text("cancelled", encoding="utf-8")
+    CONSOLE.print(f"[yellow]cancel flag written for task {args.task_id}[/yellow]")
+    return 0
 
 
 def command_peers(args: argparse.Namespace) -> int:
@@ -405,6 +526,19 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--bind-host", help="override bind host for listener")
     run_parser.add_argument("--once-handshake", action="store_true", help="exit after all peers handshake once")
     run_parser.set_defaults(func=command_run)
+    send_parser = subparsers.add_parser("send", help="enqueue a manual transfer task")
+    send_parser.add_argument("--config", default=DEFAULT_CONFIG_FILE, help="path to config file")
+    send_parser.add_argument("--peer", required=True, help="peer identifier")
+    send_parser.add_argument("--share", required=True, help="share name")
+    send_parser.add_argument("--file", required=True, help="absolute or share-relative file path")
+    send_parser.set_defaults(func=command_send)
+    queue_parser = subparsers.add_parser("queue", help="inspect transfer queue snapshot")
+    queue_parser.add_argument("--config", default=DEFAULT_CONFIG_FILE, help="path to config file")
+    queue_parser.set_defaults(func=command_queue)
+    cancel_parser = subparsers.add_parser("cancel", help="cancel a queued transfer")
+    cancel_parser.add_argument("--config", default=DEFAULT_CONFIG_FILE, help="path to config file")
+    cancel_parser.add_argument("task_id", type=int, help="task identifier")
+    cancel_parser.set_defaults(func=command_cancel)
     peers_parser = subparsers.add_parser("peers", help="show peer connection status")
     peers_parser.add_argument("--config", default=DEFAULT_CONFIG_FILE, help="path to config file")
     peers_parser.add_argument("--port", type=int, help="status HTTP port override")

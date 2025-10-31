@@ -49,10 +49,13 @@ indexing:
   max_workers: 4
 
 transfer:
-  chunk_mb: 16
-  concurrent_files: 2
-  concurrent_chunks_per_file: 2
-  rate_limit_mbps: 0   # 0 表示不限速，后续轮次生效
+  chunk_size_mb: 4
+  max_concurrent_per_peer: 2
+  retry_backoff_sec: [1, 5, 15, 60]
+  max_retries: 5
+  rate_limit_mb_s: 0
+  sessions_dir: "out/.sessions"
+  audit_log_dir: "logs/transfers"
 
 logging:
   level: "info"

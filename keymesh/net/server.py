@@ -12,6 +12,10 @@ from .framing import ProtocolError, recv_json, send_json
 from .mtls import build_server_context, extract_peer_fingerprint, fingerprint_in_whitelist
 from ..app import AppContext
 from ..proto import handshake
+from ..transfer.audit import log_event
+from ..transfer.protocol import ChecksumError, ProtocolError as TransferProtocolError, receive_file
+from ..transfer.session import TransferSession
+from ..utils.pathing import ensure_within
 
 LOGGER = logging.getLogger(__name__)
 
@@ -114,6 +118,95 @@ async def _handle_client(app_ctx: AppContext, reader: asyncio.StreamReader, writ
                 if peer_state is not None:
                     await peer_state.mark_heartbeat(time.time())  # 更新心跳时间
                 LOGGER.debug("heartbeat received from %s ts=%s", remote_id, hb["ts"])
+                continue
+            if msg_type == "FILE_REQ":
+                share_name = message.get("share")
+                relative_path = message.get("file")
+                if share_name not in allowed_shares:
+                    await send_json(
+                        writer,
+                        {
+                            "type": "FILE_META",
+                            "status": "error",
+                            "error": "share not permitted",
+                        },
+                    )
+                    LOGGER.warning("peer %s attempted unauthorized share %s", remote_id, share_name)
+                    continue
+                share_cfg = next((s for s in app_ctx.cfg.shares if s.name == share_name), None)
+                if share_cfg is None:
+                    await send_json(
+                        writer,
+                        {
+                            "type": "FILE_META",
+                            "status": "error",
+                            "error": "share not found",
+                        },
+                    )
+                    continue
+                try:
+                    target_path = ensure_within(share_cfg.path, relative_path)
+                except ValueError:
+                    await send_json(
+                        writer,
+                        {
+                            "type": "FILE_META",
+                            "status": "error",
+                            "error": "invalid target path",
+                        },
+                    )
+                    continue
+                session = TransferSession(
+                    remote_id,
+                    share_name,
+                    target_path,
+                    "pull",
+                    sessions_dir=app_ctx.cfg.transfer.sessions_dir,
+                )
+                progress = session.load_progress()
+                base_chunk = int(progress.get("chunk_id", 0))
+
+                async def _rx_progress(delta: int, chunks: int, bytes_total: int) -> None:
+                    session.save_progress(base_chunk + chunks, bytes_total)
+
+                try:
+                    summary = await receive_file(
+                        reader,
+                        writer,
+                        session.partial_path,
+                        initial_request=message,
+                        resume_offset=int(progress.get("bytes_done", 0)),
+                        rate_limit_bytes_per_sec=(
+                            app_ctx.cfg.transfer.rate_limit_mb_s * 1024 * 1024
+                            if app_ctx.cfg.transfer.rate_limit_mb_s > 0
+                            else None
+                        ),
+                        progress_cb=_rx_progress,
+                    )
+                except (TransferProtocolError, ChecksumError) as exc:
+                    LOGGER.warning("transfer from %s failed: %s", remote_id, exc)
+                    await send_json(writer, {"type": "ERROR", "error": str(exc)})
+                    continue
+                session.finalize()
+                log_event(
+                    remote_id,
+                    share_name,
+                    relative_path,
+                    "receive",
+                    "success",
+                    summary.get("bytes", 0),
+                    0.0,
+                    base_dir=app_ctx.cfg.transfer.audit_log_dir,
+                )
+                if peer_state is not None:
+                    await peer_state.mark_heartbeat(time.time())
+                LOGGER.info(
+                    "file received from %s share=%s path=%s bytes=%s",
+                    remote_id,
+                    share_name,
+                    relative_path,
+                    summary.get("bytes"),
+                )
                 continue
             LOGGER.warning("unexpected message type=%s from %s", msg_type, remote_id)
     except asyncio.CancelledError:

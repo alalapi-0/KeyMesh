@@ -79,12 +79,15 @@ class StatusHttpConfig:
 
 @dataclass(slots=True)
 class TransferConfig:
-    """传输行为配置。"""
+    """Round 4 传输配置。"""
 
-    chunk_mb: int  # 单块大小
-    concurrent_files: int  # 并发文件数
-    concurrent_chunks_per_file: int  # 每个文件并发块
-    rate_limit_mbps: int  # 限速，0 表示不限
+    chunk_size_mb: int  # 单块大小（MB）
+    max_concurrent_per_peer: int  # 每个 peer 的最大并发任务数
+    retry_backoff_sec: list[int]  # 重试退避序列
+    max_retries: int  # 单任务最大重试次数
+    rate_limit_mb_s: int  # 限速（MB/s），0 表示不限
+    sessions_dir: Path  # 会话状态持久化目录
+    audit_log_dir: Path  # 审计日志目录
 
 
 @dataclass(slots=True)
@@ -194,10 +197,13 @@ def load_config(config_path: str | Path = DEFAULT_CONFIG_FILE, *, check_files: b
         )
         peers.append(peer)  # 将 peer 加入列表
     transfer = TransferConfig(  # 构造 TransferConfig
-        chunk_mb=int(transfer_raw.get("chunk_mb", 0)),
-        concurrent_files=int(transfer_raw.get("concurrent_files", 0)),
-        concurrent_chunks_per_file=int(transfer_raw.get("concurrent_chunks_per_file", 0)),
-        rate_limit_mbps=int(transfer_raw.get("rate_limit_mbps", 0)),
+        chunk_size_mb=int(transfer_raw.get("chunk_size_mb", 4)),
+        max_concurrent_per_peer=int(transfer_raw.get("max_concurrent_per_peer", 2)),
+        retry_backoff_sec=[int(x) for x in (transfer_raw.get("retry_backoff_sec") or [1, 5, 15, 60])],
+        max_retries=int(transfer_raw.get("max_retries", 5)),
+        rate_limit_mb_s=int(transfer_raw.get("rate_limit_mb_s", 0)),
+        sessions_dir=normalize_path(path.parent, transfer_raw.get("sessions_dir", "out/.sessions")),
+        audit_log_dir=normalize_path(path.parent, transfer_raw.get("audit_log_dir", "logs/transfers")),
     )
     logging_config = LoggingConfig(  # 构造 LoggingConfig
         level=logging_raw.get("level", "info"),
@@ -253,6 +259,17 @@ def load_config(config_path: str | Path = DEFAULT_CONFIG_FILE, *, check_files: b
         raise ValueError("indexing.max_workers must be positive")
     if config.indexing.hash_policy not in {"auto", "full", "sample", "meta", "none"}:
         raise ValueError("indexing.hash_policy must be one of auto/full/sample/meta/none")
+    if config.transfer.chunk_size_mb <= 0:
+        raise ValueError("transfer.chunk_size_mb must be positive")
+    if config.transfer.max_concurrent_per_peer <= 0:
+        raise ValueError("transfer.max_concurrent_per_peer must be positive")
+    if config.transfer.max_retries < 0:
+        raise ValueError("transfer.max_retries cannot be negative")
+    if not config.transfer.retry_backoff_sec:
+        raise ValueError("transfer.retry_backoff_sec must contain at least one value")
+    for value in config.transfer.retry_backoff_sec:
+        if value < 0:
+            raise ValueError("transfer.retry_backoff_sec values cannot be negative")
     if check_files:  # 如果需要检查文件存在性
         missing: List[Path] = []  # 记录缺失路径
         for candidate in [security.ca_cert, security.cert, security.key]:  # 遍历证书文件

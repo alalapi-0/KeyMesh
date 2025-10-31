@@ -201,6 +201,62 @@ common changes:
   Deleted: a.txt
 ```
 
+## Round 4 文件传输引擎
+
+第四轮实现了 KeyMesh 的核心文件传输引擎，具备以下能力：
+
+- **可靠传输**：自定义 FILE_REQ/CHUNK/FILE_END 协议，所有帧基于 mTLS 长连接。每个数据块携带独立 `sha256` 校验，失败自动重试并可断点续传。
+- **分块与续传**：默认 4MB 分块，进度记录保存在 `out/.sessions/<peer>__<share>__file.json` 中，未完成文件以 `.part` 后缀保留，恢复后自动覆盖目标文件。
+- **速率与并发控制**：可通过 `transfer.rate_limit_mb_s`、`transfer.max_concurrent_per_peer` 限制单 peer 并发和速率，重试退避序列由 `transfer.retry_backoff_sec` 配置。
+- **审计日志**：每次传输写入 `logs/transfers/YYYY-MM-DD.log`，格式示例：
+  ```text
+  [2025-11-01T12:34:56Z] peer=host-B share=common file=a.txt action=send status=success size=4194304 time=2.3s
+  ```
+- **CLI 工具**：
+  - `python -m keymesh send --peer host-B --share common --file data/common/a.txt`
+  - `python -m keymesh queue`
+  - `python -m keymesh cancel 12`
+
+### 传输协议速览
+
+```
+FILE_REQ  ->  {"file":"docs/a.txt","share":"common","size":...}
+FILE_META <-  {"status":"ok","resume_offset":1048576}
+CHUNK     ->  {"chunk":16,"offset":1048576,"hash":"sha256:..."} + <binary>
+CHUNK_ACK <-  {"chunk":16,"status":"ok"}
+...
+FILE_END  ->  {"hash":"sha256:...","bytes":...}
+FILE_END <-   {"status":"ok"}
+```
+
+接受方在 `share` 的根目录下创建 `.part` 文件，写入完成后与最终路径原子替换。进度文件记录已完成字节与块编号，重启服务或 CLI 手动发送时会自动续传。
+
+### CLI 队列输出示例
+
+```
+$ python -m keymesh queue
+┏━━━━━━━━━┳━━━━━━┳━━━━━━┳━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━┓
+┃ Status  ┃ Task ┃ Peer ┃ Share ┃ File                 ┃ Progress ┃
+┡━━━━━━━━━╇━━━━━━╇━━━━━━╇━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━┩
+│ running │ #12  │ B    │ common│ reports/q4.pdf       │ 45.0%    │
+│ queued  │ #13  │ C    │ docs  │ handbook.md          │ 0.0%     │
+└─────────┴──────┴──────┴───────┴──────────────────────┴──────────┘
+```
+
+`python -m keymesh cancel 12` 会写入取消标记，正在运行的任务在下一次调度时自动终止。
+
+### 安全策略
+
+- 传输链路沿用 Round 2 的 mTLS 握手，证书和指纹校验逻辑保持不变。
+- 所有写入均通过 `ensure_within` 校验，确保目标文件落在共享目录内，不会越权覆盖。
+- 校验失败或异常均记录在审计日志，并保留 `.part` 文件等待人工处理。
+- 完成后使用原子重命名覆盖旧文件，避免中途出现半成品。
+
+### 性能建议
+
+- 默认 4MB 分块适用于多数场景，可根据链路质量将 `transfer.chunk_size_mb` 调整至更大值以提升吞吐。
+- 小文件建议批量触发 `keymesh send`；大文件断点续传依赖 `.sessions` 记录，请确保该目录持久化。
+
 ## Round 3 常见排错
 - **无权限路径**：manifest 扫描遇到 `PermissionError` 时会跳过该文件并在表格中统计 `skipped`，请检查共享目录权限或在 `.keymeshignore` 中排除。
 - **符号链接未收录**：当前仅索引常规文件，软链接会被忽略；如需同步请转换为硬链接或等待后续版本支持。
